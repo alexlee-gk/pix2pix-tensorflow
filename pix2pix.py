@@ -952,7 +952,7 @@ def main():
                     train_step = (results["global_step"] - 1) % examples.steps_per_epoch + 1
                     rate = (step + 1) * a.batch_size / (time.time() - start)
                     remaining = (max_steps - step) * a.batch_size / rate
-                    print("progress  epoch %d  step %d  image/sec %0.1f  remaining %dm" % (train_epoch, train_step, rate, remaining / 60))
+                    print("progress  epoch %d  step %d  image/sec %0.1f  remaining %dm (%0.1fh) (%0.1fd)" % (train_epoch, train_step, rate, remaining / 60, remaining / 60 / 60, remaining / 60 / 60 / 24))
                     print("discrim_loss", results["discrim_loss"])
                     print("gen_loss_GAN", results["gen_loss_GAN"])
                     print("gen_loss_L1", results["gen_loss_L1"])
