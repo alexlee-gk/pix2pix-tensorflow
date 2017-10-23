@@ -17,7 +17,6 @@ from docile.ops import conv2d, conv_pool2d, upsample_conv2d, lrelu, instancenorm
 from docile.utils import preprocess, deprocess
 from tensorflow.python.platform import gfile
 
-
 EPS = 1e-12
 
 Examples = collections.namedtuple("Examples", "paths, context_orig_images, orig_images, context_images, images, gen_images, context_states, states, gen_states, count, steps_per_epoch")
@@ -43,7 +42,7 @@ def gan_loss(logits, labels, gan_loss_type):
     return loss
 
 
-def load_examples(*, input_dir, mode, use_context_frames, context_frames, state_dim, scale_size, batch_size):
+def load_examples(*, input_dir, mode, use_context_images, use_context_states, context_frames, state_dim, scale_size, batch_size):
     if input_dir is None or not os.path.exists(input_dir):
         raise Exception("input_dir does not exist")
 
@@ -127,23 +126,31 @@ def load_examples(*, input_dir, mode, use_context_frames, context_frames, state_
     state = tf.reshape(features['state'], state_shape)
     gen_state = tf.reshape(features['gen_state'], state_shape)
 
-    if use_context_frames:
+    tensors = [paths, orig_image, image, gen_image, state, gen_state]
+    if use_context_images:
         context_orig_images = decode_and_preprocess_image(features['context_orig_images'], [context_frames] + orig_image_shape)
         context_images = decode_and_preprocess_image(features['context_images'], [context_frames] + image_shape)
+        tensors.extend([context_orig_images, context_images])
+    if use_context_states:
         context_states = tf.reshape(features['context_states'], [context_frames] + state_shape)
+        tensors.append(context_states)
 
-    if use_context_frames:
-        paths_batch, context_orig_images_batch, orig_image_batch, context_images_batch, image_batch, gen_image_batch, context_states_batch, state_batch, gen_state_batch = \
-            tf.train.batch([paths, context_orig_images, orig_image, context_images, image, gen_image, context_states, state, gen_state], batch_size=batch_size)
+    tensor_batches = tf.train.batch(tensors, batch_size=batch_size)
+    paths_batch, orig_image_batch, image_batch, gen_image_batch, state_batch, gen_state_batch, *tensor_batches = tensor_batches
+    if use_context_images:
+        context_orig_images_batch, context_images_batch, *tensor_batches = tensor_batches
         context_orig_images_batch = tf.unstack(context_orig_images_batch, axis=1)
         context_images_batch = tf.unstack(context_images_batch, axis=1)
-        context_states_batch = tf.unstack(context_states_batch, axis=1)
     else:
-        paths_batch, orig_image_batch, image_batch, gen_image_batch, state_batch, gen_state_batch = \
-            tf.train.batch([paths, orig_image, image, gen_image, state, gen_state], batch_size=batch_size)
         context_orig_images_batch = []
         context_images_batch = []
+    if use_context_states:
+        context_states_batch, *tensor_batches = tensor_batches
+        context_states_batch = tf.unstack(context_states_batch, axis=1)
+    else:
         context_states_batch = []
+    assert len(tensor_batches) == 0
+
     steps_per_epoch = int(math.ceil(count / batch_size))
 
     return Examples(
@@ -161,10 +168,17 @@ def load_examples(*, input_dir, mode, use_context_frames, context_frames, state_
     )
 
 
-def create_generator(generator_inputs, generator_outputs_channels, context_images, *, ngf, scale_size):
+def create_generator(generator_inputs, generator_outputs_channels, *, context_images, context_states, ngf, scale_size):
     layers = []
-    if context_images:
-        generator_inputs = tf.concat([generator_inputs] + context_images, axis=3)
+
+    if context_images is None:
+        context_images = []
+    if context_states is None:
+        context_states = []
+    tiled_context_states = [tf.tile(context_state[:, None, None, :], [1, scale_size, scale_size, 1])
+                            for context_state in context_states]
+    inputs = tf.concat([generator_inputs] + context_images + tiled_context_states, axis=-1)
+    print("generator:", inputs)
 
     if scale_size == 256:
         layer_specs = [
@@ -202,9 +216,9 @@ def create_generator(generator_inputs, generator_outputs_channels, context_image
     with tf.variable_scope("encoder_1"):
         out_channels, stride = layer_specs[0]
         if stride == 1:
-            output = conv2d(generator_inputs, out_channels, kernel_size=(4, 4))
+            output = conv2d(inputs, out_channels, kernel_size=(4, 4))
         else:
-            output = conv_pool2d(generator_inputs, out_channels, kernel_size=(4, 4), strides=(stride,) * 2, pool_mode='avg')
+            output = conv_pool2d(inputs, out_channels, kernel_size=(4, 4), strides=(stride,) * 2, pool_mode='avg')
         layers.append(output)
 
     for out_channels, stride in layer_specs[1:]:
@@ -291,13 +305,17 @@ def create_generator(generator_inputs, generator_outputs_channels, context_image
     return layers[-1]
 
 
-def create_discriminator(discrim_inputs, discrim_targets, context_images, *, ndf, scale_size):
+def create_discriminator(discrim_inputs, discrim_targets, *, context_images, context_states, ndf, scale_size):
     layers = []
-    if context_images:
-        input = tf.concat([discrim_inputs, discrim_targets], axis=3)
-    else:
-        # 2x [batch, height, width, in_channels] => [batch, height, width, in_channels * 2]
-        input = tf.concat([discrim_inputs, discrim_targets] + context_images, axis=3)
+
+    if context_images is None:
+        context_images = []
+    if context_states is None:
+        context_states = []
+    tiled_context_states = [tf.tile(context_state[:, None, None, :], [1, scale_size, scale_size, 1])
+                            for context_state in context_states]
+    inputs = tf.concat([discrim_inputs, discrim_targets] + context_images + tiled_context_states, axis=-1)
+    print("discriminator:", inputs)
 
     if scale_size == 256:
         layer_specs = [
@@ -328,7 +346,7 @@ def create_discriminator(discrim_inputs, discrim_targets, context_images, *, ndf
 
     with tf.variable_scope("layer_1"):
         out_channels, stride = layer_specs[0]
-        convolved = conv_pool2d(input, out_channels, kernel_size=(4, 4), strides=(stride,) * 2, pool_mode='avg')
+        convolved = conv_pool2d(inputs, out_channels, kernel_size=(4, 4), strides=(stride,) * 2, pool_mode='avg')
         rectified = lrelu(convolved, 0.2)
         layers.append(rectified)
 
@@ -353,13 +371,16 @@ def create_discriminator(discrim_inputs, discrim_targets, context_images, *, ndf
     return layers[-1]
 
 
-def create_model(inputs, targets, context_images, *,
+def create_model(inputs, targets, *,
+                 context_images, context_states,
                  ngf, ndf, scale_size,
                  gan_loss_type, gan_weight, l1_weight,
                  lr, beta1):
     with tf.variable_scope("generator") as scope:
         out_channels = int(targets.get_shape()[-1])
-        outputs = create_generator(inputs, out_channels, context_images,
+        outputs = create_generator(inputs, out_channels,
+                                   context_images=context_images,
+                                   context_states=context_states,
                                    ngf=ngf, scale_size=scale_size)
 
     # create two copies of discriminator, one for real pairs and one for fake pairs
@@ -367,7 +388,9 @@ def create_model(inputs, targets, context_images, *,
     with tf.name_scope("real_discriminator"):
         with tf.variable_scope("discriminator"):
             # 2x [batch, height, width, channels] => [batch, 32, 32, 1]
-            logits_real = create_discriminator(inputs, targets, context_images,
+            logits_real = create_discriminator(inputs, targets,
+                                               context_images=context_images,
+                                               context_states=context_states,
                                                ndf=ndf, scale_size=scale_size)
             if gan_loss_type == 'LSGAN':
                 predict_real = logits_real
@@ -377,7 +400,9 @@ def create_model(inputs, targets, context_images, *,
     with tf.name_scope("fake_discriminator"):
         with tf.variable_scope("discriminator", reuse=True):
             # 2x [batch, height, width, channels] => [batch, 32, 32, 1]
-            logits_fake = create_discriminator(inputs, outputs, context_images,
+            logits_fake = create_discriminator(inputs, outputs,
+                                               context_images=context_images,
+                                               context_states=context_states,
                                                ndf=ndf, scale_size=scale_size)
             if gan_loss_type == 'LSGAN':
                 predict_fake = logits_fake
@@ -451,7 +476,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1, help="number of images in batch")
     parser.add_argument("--ngf", type=int, default=64, help="number of generator filters in first conv layer")
     parser.add_argument("--ndf", type=int, default=64, help="number of discriminator filters in first conv layer")
-    parser.add_argument("--use_context_frames", type=int, default=1)
+    parser.add_argument("--use_context_images", type=int, default=1)
+    parser.add_argument("--use_context_states", type=int, default=1)
     parser.add_argument("--context_frames", type=int, default=2)
     parser.add_argument("--state_dim", type=int, default=4)
     parser.add_argument("--scale_size", type=int, default=256, help="scale images to this size")
@@ -481,7 +507,7 @@ def main():
             raise Exception("checkpoint required for test mode")
 
         # load some options from the checkpoint
-        options = {"ngf", "ndf", "use_context_frames", "context_frames", "state_dim", "scale_size"}
+        options = {"ngf", "ndf", "use_context_images", "use_context_states", "context_frames", "state_dim", "scale_size"}
         with open(os.path.join(args.checkpoint, "options.json")) as f:
             for key, val in json.loads(f.read()).items():
                 if key in options:
@@ -499,13 +525,15 @@ def main():
         config.gpu_options.per_process_gpu_memory_fraction = args.gpu_mem_frac
 
     examples = load_examples(input_dir=args.input_dir, mode=args.mode,
-                             use_context_frames=args.use_context_frames,
+                             use_context_images=args.use_context_images,
+                             use_context_states=args.use_context_states,
                              context_frames=args.context_frames, state_dim=args.state_dim,
                              scale_size=args.scale_size, batch_size=args.batch_size)
     print("examples count = %d" % examples.count)
 
     # inputs and images are [batch_size, height, width, channels]
-    model = create_model(examples.gen_images, examples.images, context_images=examples.context_images,
+    model = create_model(examples.gen_images, examples.images,
+                         context_images=examples.context_images, context_states=examples.context_states,
                          ngf=args.ngf, ndf=args.ndf, scale_size=args.scale_size,
                          gan_loss_type=args.gan_loss_type, gan_weight=args.gan_weight, l1_weight=args.l1_weight,
                          lr=args.lr, beta1=args.beta1)
